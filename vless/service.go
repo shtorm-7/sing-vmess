@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common/auth"
@@ -23,6 +24,9 @@ type Service[T comparable] struct {
 	userFlow map[T]string
 	logger   logger.Logger
 	handler  Handler
+	conns    map[T][]net.Conn
+
+	mu sync.RWMutex
 }
 
 type Handler interface {
@@ -34,6 +38,7 @@ func NewService[T comparable](logger logger.Logger, handler Handler) *Service[T]
 	return &Service[T]{
 		logger:  logger,
 		handler: handler,
+		conns:   make(map[T][]net.Conn),
 	}
 }
 
@@ -48,21 +53,45 @@ func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowLi
 		userMap[userID] = userName
 		userFlowMap[userName] = userFlowList[i]
 	}
+	s.mu.Lock()
 	s.userMap = userMap
 	s.userFlow = userFlowMap
+	var closedConns []net.Conn
+	newUserSet := make(map[T]struct{})
+	for _, user := range userList {
+		newUserSet[user] = struct{}{}
+	}
+	for user, conns := range s.conns {
+		if _, exists := newUserSet[user]; !exists {
+			closedConns = append(closedConns, conns...)
+			delete(s.conns, user)
+		}
+	}
+	s.mu.Unlock()
+	for _, conn := range closedConns {
+		conn.Close()
+	}
 }
 
 func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+	return s.NewConnectionWithOptions(ctx, conn, source, onClose, true)
+}
+
+func (s *Service[T]) NewConnectionWithOptions(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc, canSplice bool) error {
 	request, err := ReadRequest(conn)
 	if err != nil {
 		return err
 	}
+	s.mu.RLock()
 	user, loaded := s.userMap[request.UUID]
 	if !loaded {
+		s.mu.RUnlock()
 		return E.New("unknown UUID: ", uuid.FromBytesOrNil(request.UUID[:]))
 	}
-	ctx = auth.ContextWithUser(ctx, user)
 	userFlow := s.userFlow[user]
+	s.mu.RUnlock()
+	ctx = auth.ContextWithUser(ctx, user)
+
 	if request.Flow == FlowVision && request.Command == vmess.NetworkUDP {
 		return E.New(FlowVision, " flow does not support UDP")
 	} else if request.Flow != userFlow {
@@ -73,10 +102,10 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		s.handler.NewPacketConnectionEx(ctx, &serverPacketConn{ExtendedConn: bufio.NewExtendedConn(conn), destination: request.Destination}, source, request.Destination, onClose)
 		return nil
 	}
-	responseConn := &serverConn{ExtendedConn: bufio.NewExtendedConn(conn), writer: bufio.NewVectorisedWriter(conn)}
+	responseConn := &serverConn{ExtendedConn: bufio.NewExtendedConn(conn)}
 	switch userFlow {
 	case FlowVision:
-		conn, err = NewVisionConn(responseConn, conn, request.UUID, s.logger)
+		conn, err = NewVisionConn(responseConn, conn, request.UUID, s.logger, canSplice)
 		if err != nil {
 			return E.Cause(err, "initialize vision")
 		}
@@ -85,12 +114,37 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	default:
 		return E.New("unknown flow: ", userFlow)
 	}
+
+	s.mu.Lock()
+	s.conns[user] = append(s.conns[user], conn)
+	s.mu.Unlock()
+	originalOnClose := onClose
+	onClose = N.OnceClose(func(it error) {
+		s.mu.Lock()
+		conns := s.conns[user]
+		for i, c := range conns {
+			if c == conn {
+				s.conns[user] = append(conns[:i], conns[i+1:]...)
+				break
+			}
+		}
+		s.mu.Unlock()
+		if originalOnClose != nil {
+			originalOnClose(it)
+		}
+	})
 	switch request.Command {
 	case vmess.CommandTCP:
 		s.handler.NewConnectionEx(ctx, conn, source, request.Destination, onClose)
 		return nil
 	case vmess.CommandMux:
-		return vmess.HandleMuxConnection(ctx, conn, source, s.handler)
+		// HandleMuxConnection does not take onClose — fire it here so the
+		// conns entry does not leak for the lifetime of the process.
+		err := vmess.HandleMuxConnection(ctx, conn, source, s.handler)
+		if onClose != nil {
+			onClose(err)
+		}
+		return err
 	default:
 		return E.New("unknown command: ", request.Command)
 	}
@@ -103,11 +157,8 @@ func flowName(value string) string {
 	return value
 }
 
-var _ N.VectorisedWriter = (*serverConn)(nil)
-
 type serverConn struct {
 	N.ExtendedConn
-	writer          N.VectorisedWriter
 	responseWritten bool
 }
 
@@ -117,7 +168,12 @@ func (c *serverConn) Read(b []byte) (n int, err error) {
 
 func (c *serverConn) Write(b []byte) (n int, err error) {
 	if !c.responseWritten {
-		_, err = bufio.WriteVectorised(c.writer, [][]byte{{Version, 0}, b})
+		buffer := buf.NewSize(2 + len(b))
+		buffer.WriteByte(Version)
+		buffer.WriteByte(0)
+		buffer.Write(b)
+		_, err = c.ExtendedConn.Write(buffer.Bytes())
+		buffer.Release()
 		if err == nil {
 			n = len(b)
 		}
@@ -135,15 +191,6 @@ func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
 		c.responseWritten = true
 	}
 	return c.ExtendedConn.WriteBuffer(buffer)
-}
-
-func (c *serverConn) WriteVectorised(buffers []*buf.Buffer) error {
-	if !c.responseWritten {
-		err := c.writer.WriteVectorised(append([]*buf.Buffer{buf.As([]byte{Version, 0})}, buffers...))
-		c.responseWritten = true
-		return err
-	}
-	return c.writer.WriteVectorised(buffers)
 }
 
 func (c *serverConn) FrontHeadroom() int {
@@ -171,13 +218,21 @@ func (c *serverConn) Upstream() any {
 
 type serverPacketConn struct {
 	N.ExtendedConn
-	responseWriter  io.Writer
 	responseWritten bool
 	destination     M.Socksaddr
 }
 
 func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	n, err = c.ExtendedConn.Read(p)
+	var packetLen uint16
+	err = binary.Read(c.ExtendedConn, binary.BigEndian, &packetLen)
+	if err != nil {
+		return
+	}
+	if len(p) < int(packetLen) {
+		err = io.ErrShortBuffer
+		return
+	}
+	n, err = io.ReadFull(c.ExtendedConn, p[:packetLen])
 	if err != nil {
 		return
 	}
@@ -191,22 +246,15 @@ func (c *serverPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) 
 
 func (c *serverPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if !c.responseWritten {
-		if c.responseWriter == nil {
-			var packetLen [2]byte
-			binary.BigEndian.PutUint16(packetLen[:], uint16(len(p)))
-			_, err = bufio.WriteVectorised(bufio.NewVectorisedWriter(c.ExtendedConn), [][]byte{{Version, 0}, packetLen[:], p})
-			if err == nil {
-				n = len(p)
-			}
-			c.responseWritten = true
+		_, err = c.ExtendedConn.Write([]byte{Version, 0})
+		if err != nil {
 			return
-		} else {
-			_, err = c.responseWriter.Write([]byte{Version, 0})
-			if err != nil {
-				return
-			}
-			c.responseWritten = true
 		}
+		c.responseWritten = true
+	}
+	err = binary.Write(c.ExtendedConn, binary.BigEndian, uint16(len(p)))
+	if err != nil {
+		return
 	}
 	return c.ExtendedConn.Write(p)
 }
@@ -229,19 +277,11 @@ func (c *serverPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksad
 
 func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	if !c.responseWritten {
-		if c.responseWriter == nil {
-			var packetLen [2]byte
-			binary.BigEndian.PutUint16(packetLen[:], uint16(buffer.Len()))
-			err := bufio.NewVectorisedWriter(c.ExtendedConn).WriteVectorised([]*buf.Buffer{buf.As([]byte{Version, 0}), buf.As(packetLen[:]), buffer})
-			c.responseWritten = true
+		_, err := c.ExtendedConn.Write([]byte{Version, 0})
+		if err != nil {
 			return err
-		} else {
-			_, err := c.responseWriter.Write([]byte{Version, 0})
-			if err != nil {
-				return err
-			}
-			c.responseWritten = true
 		}
+		c.responseWritten = true
 	}
 	packetLen := buffer.Len()
 	binary.BigEndian.PutUint16(buffer.ExtendHeader(2), uint16(packetLen))

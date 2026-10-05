@@ -13,6 +13,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -54,6 +55,9 @@ type Service[U comparable] struct {
 	alterIdMap           map[[16]byte]legacyUserEntry[U]
 	alterIdUpdateTask    *time.Ticker
 	alterIdUpdateDone    chan struct{}
+	conns                map[U][]net.Conn
+
+	mu sync.RWMutex
 }
 
 type legacyUserEntry[U comparable] struct {
@@ -67,6 +71,7 @@ func NewService[U comparable](handler Handler, options ...ServiceOption) *Servic
 		replayFilter: replay.NewSimple(time.Second * 120),
 		handler:      handler,
 		time:         time.Now,
+		conns:        make(map[U][]net.Conn),
 	}
 	anyService := (*Service[string])(unsafe.Pointer(service))
 	for _, option := range options {
@@ -103,11 +108,27 @@ func (s *Service[U]) UpdateUsers(userList []U, userIdList []string, alterIdList 
 			userAlterIds[user] = alterIds
 		}
 	}
+	s.mu.Lock()
 	s.userKey = userKeyMap
 	s.userIdCipher = userIdCipherMap
 	s.alterIds = userAlterIds
 	s.alterIdUpdateTime = make(map[U]int64)
 	s.generateLegacyKeys()
+	var closedConns []net.Conn
+	newUserSet := make(map[U]struct{})
+	for _, user := range userList {
+		newUserSet[user] = struct{}{}
+	}
+	for user, conns := range s.conns {
+		if _, exists := newUserSet[user]; !exists {
+			closedConns = append(closedConns, conns...)
+			delete(s.conns, user)
+		}
+	}
+	s.mu.Unlock()
+	for _, conn := range closedConns {
+		conn.Close()
+	}
 	return nil
 }
 
@@ -136,7 +157,9 @@ func (s *Service[U]) loopGenerateLegacyKeys() {
 			return
 		case <-s.alterIdUpdateTask.C:
 		}
+		s.mu.Lock()
 		s.generateLegacyKeys()
+		s.mu.Unlock()
 	}
 }
 
@@ -198,6 +221,7 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	var decodedId [16]byte
 	var user U
 	var found bool
+	s.mu.RLock()
 	for currUser, userIdBlock := range s.userIdCipher {
 		userIdBlock.Decrypt(decodedId[:], authId)
 		timestamp := int64(binary.BigEndian.Uint64(decodedId[:]))
@@ -228,11 +252,32 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		}
 	}
 	if !found {
+		s.mu.RUnlock()
 		return ErrBadRequest
 	}
 
 	ctx = auth.ContextWithUser(ctx, user)
 	cmdKey := s.userKey[user]
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	s.conns[user] = append(s.conns[user], conn)
+	s.mu.Unlock()
+	originalOnClose := onClose
+	onClose = N.OnceClose(func(it error) {
+		s.mu.Lock()
+		conns := s.conns[user]
+		for i, c := range conns {
+			if c == conn {
+				s.conns[user] = append(conns[:i], conns[i+1:]...)
+				break
+			}
+		}
+		s.mu.Unlock()
+		if originalOnClose != nil {
+			originalOnClose(it)
+		}
+	})
 	var headerReader io.Reader
 	var headerBuffer []byte
 
@@ -367,6 +412,8 @@ func (s *Service[U]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	return nil
 }
 
+var _ N.EarlyWriter = (*rawServerConn)(nil)
+
 type rawServerConn struct {
 	net.Conn
 	legacyProtocol bool
@@ -442,7 +489,7 @@ func (c *rawServerConn) RearHeadroom() int {
 	return MaxRearHeadroom
 }
 
-func (c *rawServerConn) NeedHandshake() bool {
+func (c *rawServerConn) NeedHandshakeForWrite() bool {
 	return c.writer == nil
 }
 

@@ -38,8 +38,14 @@ func NewClient(userId string, flow string, logger logger.Logger) (*Client, error
 }
 
 func (c *Client) prepareConn(conn net.Conn, tlsConn net.Conn) (net.Conn, error) {
+	return c.prepareConnWithOptions(conn, tlsConn, true)
+}
+
+func (c *Client) prepareConnWithOptions(conn net.Conn, tlsConn net.Conn, canSplice bool) (net.Conn, error) {
 	if c.flow == FlowVision {
-		protocolConn, err := NewVisionConn(conn, tlsConn, c.key, c.logger)
+		// Unwrap to find the real TLS connection
+		actualTLSConn := unwrapConn(tlsConn)
+		protocolConn, err := NewVisionConn(conn, actualTLSConn, c.key, c.logger, canSplice)
 		if err != nil {
 			return nil, E.Cause(err, "initialize vision")
 		}
@@ -59,6 +65,14 @@ func (c *Client) DialConn(conn net.Conn, destination M.Socksaddr) (net.Conn, err
 
 func (c *Client) DialEarlyConn(conn net.Conn, destination M.Socksaddr) (net.Conn, error) {
 	return c.prepareConn(NewConn(conn, c.key, vmess.CommandTCP, destination, c.flow), conn)
+}
+
+func (c *Client) DialEarlyConnWithBase(conn net.Conn, baseConn net.Conn, destination M.Socksaddr) (net.Conn, error) {
+	return c.DialEarlyConnWithOptions(conn, baseConn, destination, true)
+}
+
+func (c *Client) DialEarlyConnWithOptions(conn net.Conn, baseConn net.Conn, destination M.Socksaddr, canSplice bool) (net.Conn, error) {
+	return c.prepareConnWithOptions(NewConn(conn, c.key, vmess.CommandTCP, destination, c.flow), baseConn, canSplice)
 }
 
 func (c *Client) DialPacketConn(conn net.Conn, destination M.Socksaddr) (*PacketConn, error) {
@@ -89,13 +103,12 @@ func (c *Client) DialEarlyXUDPPacketConn(conn net.Conn, destination M.Socksaddr)
 }
 
 var (
-	_ N.EarlyConn        = (*Conn)(nil)
-	_ N.VectorisedWriter = (*Conn)(nil)
+	_ N.EarlyReader = (*Conn)(nil)
+	_ N.EarlyWriter = (*Conn)(nil)
 )
 
 type Conn struct {
 	N.ExtendedConn
-	writer         N.VectorisedWriter
 	request        Request
 	requestWritten bool
 	responseRead   bool
@@ -104,7 +117,6 @@ type Conn struct {
 func NewConn(conn net.Conn, uuid [16]byte, command byte, destination M.Socksaddr, flow string) *Conn {
 	return &Conn{
 		ExtendedConn: bufio.NewExtendedConn(conn),
-		writer:       bufio.NewVectorisedWriter(conn),
 		request: Request{
 			UUID:        uuid,
 			Command:     command,
@@ -159,20 +171,6 @@ func (c *Conn) WriteBuffer(buffer *buf.Buffer) error {
 	return c.ExtendedConn.WriteBuffer(buffer)
 }
 
-func (c *Conn) WriteVectorised(buffers []*buf.Buffer) error {
-	if !c.requestWritten {
-		buffer := buf.NewSize(RequestLen(c.request))
-		err := EncodeRequest(c.request, buffer)
-		if err != nil {
-			buffer.Release()
-			return err
-		}
-		c.requestWritten = true
-		return c.writer.WriteVectorised(append([]*buf.Buffer{buffer}, buffers...))
-	}
-	return c.writer.WriteVectorised(buffers)
-}
-
 func (c *Conn) ReaderReplaceable() bool {
 	return c.responseRead
 }
@@ -181,7 +179,11 @@ func (c *Conn) WriterReplaceable() bool {
 	return c.requestWritten
 }
 
-func (c *Conn) NeedHandshake() bool {
+func (c *Conn) NeedHandshakeForRead() bool {
+	return !c.responseRead
+}
+
+func (c *Conn) NeedHandshakeForWrite() bool {
 	return !c.requestWritten
 }
 
@@ -223,7 +225,7 @@ func (c *PacketConn) Read(b []byte) (n int, err error) {
 	if err != nil {
 		return
 	}
-	if cap(b) < int(length) {
+	if len(b) < int(length) {
 		return 0, io.ErrShortBuffer
 	}
 	return io.ReadFull(c.Conn, b[:length])
